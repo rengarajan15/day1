@@ -1,0 +1,584 @@
+package com.hcsc.datalake.spark.utils
+
+import scala.collection.mutable.ListBuffer
+import org.apache.hadoop.fs.{FileSystem,Path}
+import org.apache.spark.sql.{DataFrame,Row,SparkSession}
+import org.apache.spark.sql.functions.{col,lit}
+import org.apache.spark.sql.types.{LongType,StringType,StructField,StructType}
+import org.json4s.jackson.JsonMethods._
+import sys.process._
+import org.apache.spark.storage.StorageLevel
+import java.text.SimpleDateFormat
+import java.io.BufferedOutputStream
+import scala.util.Try
+
+object AppUtil extends Util {
+
+	//Parse the mapFile that contains Source and destination columns to get full directory path
+	def RetriveFilePath(sparkSes: SparkSession, srcPath: String, hist_start_date: String, hist_end_date: String)={
+			    val fs                     = FileSystem.get(sparkSes.sparkContext.hadoopConfiguration)
+			    val destPath               = Globals.configMap("DEST_PATH").toString()
+			    val latest_partition_ind   = Globals.configMap("LATEST_PARTITION_IND").toString().toLowerCase()
+			    val load_type              = Globals.configMap("LOAD_TYPE").toString().toLowerCase()
+			    val filedate_format        = new SimpleDateFormat(Globals.configMap("FILEDATE_FORMAT").toString())
+					val partition_name_length  = Globals.configMap("PARTITION_NAME_LENGTH").toString().toInt
+					val partition_date_length  = Globals.configMap("PARTITION_DATE_LENGTH").toString().toInt
+					val partition_time         = Globals.configMap("PARTITION_TIME_COL").toString().toLowerCase()
+			    val processMap             = Map("src" -> srcPath , "dest" -> destPath)
+			    var src_path               = ""
+
+			    latest_partition_ind match
+			    {
+			      case "n" =>
+			        {
+			          load_type match
+			          {
+			            case "direct_load" | "incremental_daily" =>
+			              {
+					            if(fs.isFile(new Path((processMap("src").toString))))
+					              {
+					                Globals.alldirBf += Map("src" -> processMap("src").toString,"dest" -> processMap("dest").toString)
+					              } else
+					              {
+                          if(fs.listStatus(new Path((processMap("src").toString))).filter(_.isFile).length.>(0))
+			                      {
+				                      BuildListOfFiles(processMap("src").toString,processMap("dest").toString,fs)
+			                      } else
+						                {
+							                Globals.alldirBf.clear()
+							                fs.listStatus(new Path(processMap("src").toString)).filter(_.isDirectory).map(_.getPath).foreach(i => {BuildListOfFiles(i.toString(),processMap("dest").toString,fs)})
+						                }
+					               }
+			                }
+			            case "history" =>
+	    			            {
+	    			        	    if(fs.listStatus(new Path(processMap("src").toString)).filter( _.isDirectory).length.>(0))
+	    			        	      {
+	    			        		      fs.listStatus(new Path(processMap("src").toString)).filter( _.isDirectory).map(_.getPath).foreach(i =>
+	    			        		        {
+	    			        					    var file_date_string = (i.toString).split("/").reverse(0).substring(partition_name_length)
+	    			        					    var parsing_success  = Try(filedate_format.parse(file_date_string)).isSuccess
+	    			        					    println("#### date parsed "+parsing_success+" for "+file_date_string)
+
+	    			        					    //if(file_date_string.length.equals(partition_date_length))
+	    			        					    if(parsing_success)
+	    			        					      {
+	    			        						      var file_date = filedate_format.parse(file_date_string)
+	    			        								  val from_date = filedate_format.parse(hist_start_date)
+	    			        								  val till_date = filedate_format.parse(hist_end_date)
+	    			        								  if((file_date.after(from_date) && file_date.before(till_date)) || file_date.equals(from_date) || file_date.equals(till_date))
+	    			        								    {
+	    			        								    if (partition_time.length().>(0))
+	    			        								    {
+	    			        								      if (fs.listStatus(new Path(i.toString)).filter( _.isDirectory).length.>(0))
+	    			        								      {
+	    			        										      fs.listStatus(new Path(i.toString)).filter( _.isDirectory).foreach(k =>
+	    			        										      {
+	    			        														  src_path=k.getPath.toString+"/*"
+	    			        														  Globals.alldirBf += Map("src" -> src_path, "dest" -> processMap("dest").toString)
+	    			        										      })
+	    			        								      }
+	    			        								    } else
+	    			        								    {
+	    			        												src_path=i.toString+"/*"
+	    			        												Globals.alldirBf += Map("src" -> src_path, "dest" -> processMap("dest").toString)
+	    			        								    }
+	    			        								    }
+	    			        					        }
+	    			        		           })
+	    			        	          }
+	    			                }
+			            }
+			          }
+			        case "y" =>
+			          {
+	    	          var mod_time:Long=0
+
+	    	          load_type match
+	    			        {
+	    			          case "direct_load" | "incremental_daily"=>
+	    			            {
+	    				            if(fs.listStatus(new Path(processMap("src").toString)).filter( _.isDirectory).length.>(0))
+	    				              {
+	    					              (fs.listStatus(new Path(processMap("src").toString)).filter( _.isDirectory)).foreach(i=>
+	    					                {
+	    						                if(mod_time < i.getModificationTime)
+	    						                  {
+	    							                  mod_time = i.getModificationTime
+	    									              src_path = i.getPath.toString+"/*"
+	    						                  }
+	    					                })
+	    				               } else
+	    				               {
+	    					               (fs.listStatus(new Path(processMap("src").toString)).filter( _.isFile)).foreach(i=>
+	    					                 {
+	    						                 if(mod_time < i.getModificationTime)
+	    						                  {
+	    							                  mod_time = i.getModificationTime
+	    									              src_path = i.getPath.toString
+	    						                  }
+	    					                 })
+	    				               }
+	    				             Globals.alldirBf += Map("src" -> src_path, "dest" -> processMap("dest").toString)
+	    			            }
+	    			          case "history"=>
+	    			            {
+	    			        	    if(fs.listStatus(new Path(processMap("src").toString)).filter( _.isDirectory).length.>(0))
+	    			        	      {
+	    			        		      fs.listStatus(new Path(processMap("src").toString)).filter( _.isDirectory).map(_.getPath).foreach(i =>
+	    			        		        {
+	    			        					    var file_date_string = (i.toString).split("/").reverse(0).substring(partition_name_length)
+	    			        					    if(file_date_string.length.equals(partition_date_length))
+	    			        					      {
+	    			        						      var file_date = filedate_format.parse(file_date_string)
+	    			        								  val from_date = filedate_format.parse(hist_start_date)
+	    			        								  val till_date = filedate_format.parse(hist_end_date)
+	    			        								  if((file_date.after(from_date) && file_date.before(till_date)) || file_date.equals(from_date) || file_date.equals(till_date))
+	    			        								    {
+	    			        								    if (partition_time.length().>(0))
+	    			        								    {
+	    			        									    if (fs.listStatus(new Path(i.toString)).filter( _.isDirectory).length.>(0))
+	    			        									      {
+	    			        										      fs.listStatus(new Path(i.toString)).filter( _.isDirectory).foreach(k =>
+	    			        										      {
+	    			        											    if(mod_time < k.getModificationTime)
+	    			        											      {
+	    			        												      mod_time=k.getModificationTime
+	    			        														  src_path=k.getPath.toString+"/*"
+	    			        											      }
+	    			        										      })
+	    			        									       }
+	    			        								    } else
+	    			        									       {
+	    			        										       fs.listStatus(new Path(i.toString)).filter( _.isFile).foreach(k =>
+	    			        										       {
+	    			        											       if(mod_time < k.getModificationTime)
+	    			        											        {
+	    			        												        mod_time=k.getModificationTime
+	    			        														    src_path=k.getPath.toString
+	    			        											        }
+	    			        										       })
+	    			        									        }
+	    			        								    if (src_path.length().>(0))
+	    			        								    {
+	    			        									    Globals.alldirBf += Map("src" -> src_path, "dest" -> processMap("dest").toString)
+	    			        								    }
+	    			        								       }
+	    			        					         }
+	    			        		           })
+	    			        	          }
+	    			                }
+	    			        }
+			          }
+			      }
+			    println("#### Src & Dest paths list : "+Globals.alldirBf)
+					Globals.alldirBf
+	}
+
+	//Recursive function to frame the absolute path without filename
+	def BuildListOfFiles(dir: String,dest: String,fs :FileSystem ):Unit = {
+			    if(fs.listStatus(new Path(dir)).filter( _.isFile).length.>(0))
+			      {
+			           var hdfspath     = dir+"/*"
+			           Globals.alldirBf += Map("src" -> hdfspath,"dest" -> dest)
+			      } else
+			      {
+				      fs.listStatus(new Path(dir)).filter(_.isDirectory).map(_.getPath).foreach(i => BuildListOfFiles(i.toString,dest,fs))
+			      }
+	}
+
+	//Load Config File and Assign it global Map
+	def LoadConfigFile(sparkSes: SparkSession, configFile: String)={
+			    val flowConfigdf  = sparkSes.read.json(configFile)
+					Globals.configMap = flowConfigdf.collect.map(r => Map(flowConfigdf.columns.zip(r.toSeq):_*)).head
+	}
+
+	//Build Schema from the schema file
+	def BuildSchema(sparkSes: SparkSession, schemaFile: String)={
+			    val schemaConfig     = sparkSes.read.format("csv").option("header", "true").option("inferSchema","true").load(schemaFile).na.fill("null")
+					val schemaDF         = schemaConfig.toJSON.collect.toList
+					Globals.schemaMap    = schemaDF.map(u=> parse(u).values.asInstanceOf[Map[String,Any]])
+					var colListBf        = new ListBuffer[String]()
+					var colItem : String = ""
+
+					Globals.schemaMap.foreach(i =>
+					  {
+						colItem   = i("sourcecolname").toString()
+						colListBf += colItem
+						})
+
+					Globals.colList = colListBf.toList
+					val structList  = Globals.colList.map(queryItem => StructField(queryItem,StringType,nullable=true))
+					val schema      = StructType(structList)
+					schema
+	}
+
+	//Remove the mentioned number head & tail records
+	def headerTrailerSlice(sparkSes:SparkSession,inputDf: DataFrame, header_count:Int,trailer_count:Int, src: String)={
+			    val colListwithSeq = Globals.colList :+ "seq_id"
+					val structList     = colListwithSeq.map(queryItem => if(queryItem.equals("seq_id")){StructField(queryItem,LongType,nullable=true)} else {StructField(queryItem,StringType,nullable=true)})
+					val schema         = StructType(structList)
+					val rows           = inputDf.rdd.zipWithIndex().map{row => Row.fromSeq(row._1.toSeq :+ row._2)}
+			    //val rows         = inputDf.rdd.zipWithIndex().map{case (row, seq_id) => Row.fromSeq(row.toSeq :+ seq_id)}
+		    	val intDf          = sparkSes.createDataFrame(rows, schema)
+					val totalcount     = inputDf.count()
+					val outputDf       = intDf.filter(col("seq_id") >= (header_count) && col("seq_id") < (totalcount-trailer_count)).drop("seq_id")
+					logger.info(s"### head -- $header_count & tail -- $trailer_count have been removed for '$src' ###")
+					outputDf
+	}
+
+	//Write as an ORC file in target location
+	def writeTgtDest(sparkSes:SparkSession, alldirBf:ListBuffer[Map[String,String]], schema:StructType)={
+			    val target_file_type       = Globals.configMap("TARGET_FILE_TYPE").toString().toLowerCase()
+			    val input_file_type        = Globals.configMap("INPUT_FILE_TYPE").toString().toLowerCase()
+					val compression            = Globals.configMap("TARGET_COMPRESSION").toString()
+					val repartition_count      = Globals.configMap("REPARTITION_COUNT").toString().toInt
+					val delimiter              = Globals.configMap("DELIMITER").toString()
+					val transform_ind          = Globals.configMap("TRANSFORM").toString().toLowerCase()
+					val header_count           = Globals.configMap("NUM_HEADER").toString().toInt
+					val trailer_count          = Globals.configMap("NUM_TRAILER").toString().toInt
+					val hive_db                = Globals.configMap("HIVE_DB").toString()
+					val hive_table             = Globals.configMap("HIVE_TABLE").toString()
+					val drop_columns           = Globals.configMap("DROP_COLUMNS").toString().split(",")
+					val load_type              = Globals.configMap("LOAD_TYPE").toString().toLowerCase()
+					val partition_date         = Globals.configMap("PARTITION_DATE_COL").toString().toLowerCase()
+					val partition_time         = Globals.configMap("PARTITION_TIME_COL").toString().toLowerCase()
+			    val header_ind             = Globals.configMap("HEADER_IND").toString().toLowerCase()
+			    val srcPath                = Globals.configMap("SRC_PATH").toString()
+			    val partition_name_length  = Globals.configMap("PARTITION_NAME_LENGTH").toString().toInt
+			    val fs                     = FileSystem.get(sparkSes.sparkContext.hadoopConfiguration)
+
+			    var fileDelimiter = ","
+					  if(delimiter.length() > 0){fileDelimiter = delimiter}
+
+			    var fileHeaderCount = 0
+					  if(header_count > 0){fileHeaderCount = header_count}
+
+			    var fileTrailerCount = 0
+					  if(trailer_count > 0){fileTrailerCount = trailer_count}
+
+			    var actDf        = sparkSes.createDataFrame(sparkSes.sparkContext.emptyRDD[Row], schema)
+					var writeFlag    = "N"
+					var curr_index   = 0
+					var next_index   = 0
+					var alldirBfsize = alldirBf.size.toInt
+					var srcCount     = 0
+
+					try{
+					alldirBf.foreach(i =>
+					  {
+					    var src        = i("src").toString()
+					    println("#### Current src path : "+src)
+					    var src_sliced = src.substring(0, (src.length())-1)
+
+						  if(writeFlag.equals("Y")){
+						    actDf    = sparkSes.createDataFrame(sparkSes.sparkContext.emptyRDD[Row], schema)
+						    srcCount = 0
+						    }
+
+						  writeFlag     = "N"
+							val dest      = i("dest").toString()
+							var splitList = src.split("/").reverse
+							var fileTime  = ""
+							var fileDate  = ""
+
+							if(!partition_time.isEmpty())
+							  {
+							    fileTime = splitList(1).substring(partition_name_length)
+							    fileDate = splitList(2).substring(partition_name_length)
+							  } else {fileDate = splitList(1).substring(partition_name_length)}
+
+							var nextSrcBf    = Map[String,String]()
+							var nextSrcDate  = ""
+							var fileDate_pos = if(!partition_time.isEmpty()) {2} else {1}
+							var next_index   = curr_index + 1
+
+							if(next_index < alldirBfsize)
+  						  {
+							    nextSrcBf   = alldirBf(next_index)
+								  nextSrcDate = nextSrcBf("src").toString().split("/").reverse(fileDate_pos).substring(partition_name_length)
+							  }
+
+					    if(fs.listStatus(new Path(src_sliced)).filter( _.isFile).length.>(0))
+					    {
+							val srcDf = input_file_type match
+							  {
+							    case "csv" | "text" | "psv" => sparkSes.read.format(input_file_type).option("header", header_ind).option("delimiter",fileDelimiter).schema(schema).load(src).na.fill("null")
+							    case "orc" => sparkSes.read.format(input_file_type).schema(schema).load(src)
+							    case "json_nl" => {
+							      val rdd       = sparkSes.sparkContext.textFile(src+".json")
+							      val final_rdd = rdd.map(x=> x.stripPrefix(",")).filter(x=> !x.startsWith("[")).filter(x=> !x.startsWith("]"))
+							      sparkSes.read.schema(schema).json(final_rdd)
+							      }
+							  }
+
+							val outDF              = if(fileHeaderCount > 0 || fileTrailerCount > 0){headerTrailerSlice(sparkSes,srcDf,fileHeaderCount,fileTrailerCount,src)}else {srcDf}
+						  val srcwithpartitiondf = if(fileTime.isEmpty()){outDF.withColumn(partition_date,lit(fileDate))} else {outDF.withColumn(partition_time, lit(fileTime)).withColumn(partition_date,lit(fileDate))}
+						  srcCount               = srcwithpartitiondf.count.toInt + srcCount
+
+						  println("#### srcDf count "+ srcCount)
+
+						  if (srcCount.>(0))
+						  {
+						  load_type match
+						    {
+						      case "direct_load" =>
+						        {
+							        actDf     = srcwithpartitiondf
+							        writeFlag = "Y"
+						        }
+						      case "incremental_daily" | "history" =>
+						        {
+						          fileTime = ""
+									    if(next_index < alldirBfsize)
+  									    {
+												  if (fileDate!=nextSrcDate) {writeFlag="Y"}
+										      curr_index += 1
+									       } else {writeFlag="Y"}
+							          actDf = actDf.union(srcwithpartitiondf)
+							          println("#### actDf count "+actDf.count())
+						        }
+/*						      case "incremental_hourly" =>
+						        {
+						          fileTime  = ""
+						          actDf     = actDf.union(srcwithpartitiondf)
+						          writeFlag ="Y"
+						        }*/
+						      case _ => logger.warn("Load type not mentioned in the JSON")
+						     }
+						  } else {
+					      load_type match
+					      {
+					        case "history" | "incremental_daily" =>
+					          {
+					            fileTime = ""
+					            if (fileDate!=nextSrcDate) {writeFlag="Y"}
+					          }
+					      }
+					      curr_index += 1
+						    }
+					    } else {
+					      load_type match
+					      {
+					        case "history" | "incremental_daily" =>
+					          {
+					            fileTime = ""
+					            if (fileDate!=nextSrcDate) {writeFlag="Y"}
+					          }
+					      }
+					      curr_index += 1
+					      }
+
+					    println("#### writeFlag "+writeFlag)
+
+						  if(writeFlag.equals("Y") && actDf.count.toInt.>(0))
+						    {
+						    println("#### actDf count before transformation "+actDf.count())
+							    transform_ind match
+							      {
+							        case "yes" =>
+							          {
+								        actDf.createOrReplaceTempView("rawTbl")
+								        actDf = frameQueryList(sparkSes,Globals.schemaMap,src,dest,fileDate,fileTime,target_file_type,compression,repartition_count,drop_columns,load_type,hive_db,hive_table,partition_date,partition_time)
+								        println("#### transformed actDf count "+actDf.count())
+							          }
+							        case "no" => actDf
+							        case _ => logger.warn("Transform ind not mentioned in the JSON")
+							      }
+
+								  val partition_count = sparkSes.sql(s"select distinct $partition_date from $hive_db.$hive_table where $partition_date='$fileDate'")
+								  println("#### partition count "+partition_count.count.toInt)
+
+								  if (partition_count.count.toInt.equals(1))
+									  {
+									    sparkSes.sql(s"alter table $hive_db.$hive_table drop partition ($partition_date='$fileDate')")
+									  }
+
+							    load_type match
+								    {
+								      case "direct_load" =>
+								        {
+								          if(!partition_time.isEmpty())
+								          {
+								          actDf.drop(drop_columns :_*).repartition(repartition_count).write.format(target_file_type).option("compression",compression).mode("overwrite").save(dest+"/"+partition_date+"="+fileDate+"/"+partition_time+"="+fileTime)
+								          sparkSes.sql(s"alter table $hive_db.$hive_table add partition ($partition_date='$fileDate',$partition_time='$fileTime')")
+								          logger.info(s"### $hive_db.$hive_table table added with partition $partition_date=$fileDate,$partition_time=$fileTime ###")
+								          } else
+								          {
+								          actDf.drop(drop_columns :_*).repartition(repartition_count).write.format(target_file_type).option("compression",compression).mode("overwrite").save(dest+"/"+partition_date+"="+fileDate)
+								          sparkSes.sql(s"alter table $hive_db.$hive_table add partition ($partition_date='$fileDate')")
+								          logger.info(s"### $hive_db.$hive_table table added with partition $partition_date=$fileDate ###")
+								          }
+								        }
+								      case "history" | "incremental_daily" =>
+								        {
+								          actDf.drop(drop_columns :_*).repartition(repartition_count).write.format(target_file_type).option("compression",compression).mode("overwrite").save(dest+"/"+partition_date+"="+fileDate)
+									        sparkSes.sql(s"alter table $hive_db.$hive_table add partition ($partition_date='$fileDate')")
+									        logger.info(s"### $hive_db.$hive_table table added with partition $partition_date=$fileDate ###")
+
+									        var logging_content = (s"Table name=$hive_table\nFile date=$fileDate\nsrcCount || tgtCount ==> "+srcCount+" || "+actDf.count+"\n\n")
+									        logging(sparkSes,load_type,hive_table,logging_content)
+								        }
+//								    case "incremental_hourly" =>
+//								      {
+//                        val partition_count = sparkSes.sql(s"select distinct $partition_date from $hive_db.$hive_table where $partition_date='$fileDate'")
+//										    if (partition_count.count.toInt.equals(1))
+//											    {
+//											      val tmpDf = sparkSes.read.orc(s"$dest/$partition_date=$fileDate/*")
+//											  	  actDf     = actDf.drop(drop_columns :_*).union(tmpDf)
+//														sparkSes.sql(s"alter table $hive_db.$hive_table drop partition ($partition_date='$fileDate')")
+//											    } else {actDf = actDf.drop(drop_columns :_*)}
+//								        actDf.persist(StorageLevel.MEMORY_AND_DISK).count()
+//												actDf.repartition(repartition_count).write.format(target_file_type).option("compression",compression).mode("overwrite").save(dest+"/"+partition_date+"="+fileDate)
+//												actDf.unpersist()
+//												sparkSes.sql(s"alter table $hive_db.$hive_table add partition ($partition_date='$fileDate')")
+//									      logger.info(s"### $hive_db.$hive_table table added with partition $partition_date=$fileDate ###")
+//								       }
+								    }
+
+									  var audit_dest_count = sparkSes.read.orc(dest+"/"+partition_date+"="+fileDate+"/*").count().toInt
+									  var audit_dest_table = hive_db+"."+hive_table
+
+									  if(!srcCount.equals(audit_dest_count))
+									    {
+									      curationAudit(srcCount,audit_dest_count,src,audit_dest_table)
+									    }
+
+                    logger.info(s"### orc file '$src' written to '$dest' ###")
+						    }
+					  })
+					}
+			    catch
+			    {
+					  case ex:Exception =>
+					    {
+					      logger.error("### Error while reading or writing data to dest path ###")
+					      logger.error(s"$ex")
+					    }
+					}
+	}
+
+	//frame select query to apply transformation
+	def frameQueryList(sparkSes:SparkSession, processMap: List[Map[String, Any]],src:String,dest:String,fileDate:String,fileTime:String,target_file_type:String,compression:String,repartition_count:Int,drop_columns:Array[String],load_type:String,hive_db:String,hive_table:String,partition_date:String,partition_time:String)={
+			    var queryListBf = new ListBuffer[String]()
+
+					//Framing the query list for select statement
+					processMap.foreach(i =>
+					{
+						    var queryItem : String      = ""
+								var targetdatatype : String = ""
+								queryItem                   = ""
+
+								i("targettranstype") match
+								  {
+								    case "direct" => queryItem = i("sourcecolname") +" as "+ i("targetcolname")
+								    case "cast"   => queryItem = i("targetdatatype") match
+								      {
+								        case "date"        => "cast(date_format(cast(unix_timestamp(" + i("sourcecolname") + ",'"+i("targettrans")+"') as timestamp),'yyyy-MM-dd') as date) as " + i("targetcolname")
+								        case "timestamp"   => "cast(date_format(cast(unix_timestamp(" + i("sourcecolname") + ",'"+i("targettrans")+"') as timestamp),'yyyy-MM-dd HH:mm:ss') as timestamp) as " + i("targetcolname")
+								        case "timestamp_T" => "cast(date_format(cast(unix_timestamp(" + i("sourcecolname") + ",\""+i("targettrans")+"\") as timestamp),'yyyy-MM-dd HH:mm:ss') as timestamp) as " + i("targetcolname")
+								        case _             =>
+								          {
+									          targetdatatype = i("targetdatatype").toString().replace(';', ',')
+											      "cast("+i("sourcecolname")+ " as " + targetdatatype + ") as " + i("targetcolname")
+								          }
+								       }
+								    case "null"   => queryItem = i("sourcecolname").toString()
+								    case _        => println("other's")
+								  }
+					       queryListBf += queryItem
+					})
+
+					logger.info("### queryList buffered ###")
+			    val queryList = queryListBf.toList.mkString(",")
+					val selQuery  = if(!fileTime.isEmpty())
+					  {
+						  s"select $queryList from rawTbl where $partition_date = '$fileDate' and $partition_time = '$fileTime'"
+					  } else
+					  {
+						  s"select $queryList from rawTbl where $partition_date = '$fileDate'"
+					  }
+			    val curatedDf = sparkSes.sql(selQuery)
+			    println("#### curatedDf count "+curatedDf.count())
+					logger.info(s"### transformed dataframe created for $src ###")
+          curatedDf
+	}
+
+	//curation audit part
+	def curationAudit (audit_src_count: Long, audit_dest_count: Long, audit_src_path: String, audit_dest_table: String){
+	  val date        = java.time.LocalDate.now.toString()
+	  val to_mail     = Globals.configMap("AUDIT_TO_MAIL").toString().toLowerCase()
+	  val ServerName  = "hostname"!!
+	  val Subject     = s"FAILED!!Audit_Status--COUNT_Out_of_Balance_for_on_table_$audit_dest_table"
+	  val body        = s"""
+                      Hi Team,\r\n
+	                     \tPlease be informed that there is a  Record count mismatch between Raw and curated files for ingested '$audit_dest_table' file on '$date' in '$ServerName' server. Please check details below.\r\n
+
+		                       \t\tSource Count => $audit_src_count\r\n
+		                       \t\tTarget Count => $audit_dest_count\r\n
+
+                       \tSource count -> Record count of all the files present in the source location '$audit_src_path'*\r\n
+	                     \tTarget count -> Hive table ('$audit_dest_table') count for the same partition\r\n
+                      Thanks!!"""
+	  var result      = s"echo $body" #| s"mail -s $Subject -r NoReply<noreply@bcbsil.com> $to_mail" !
+
+	  logger.error(s"### Exiting job due to count mismatch ###")
+	  System.exit(1)
+	}
+
+	//write log files
+	def logging (sparkSes:SparkSession, load_type: String, hive_table: String, content: String) {
+			    val fs            = FileSystem.get(sparkSes.sparkContext.hadoopConfiguration)
+			    val logPath       = Globals.configMap("LOG_PATH").toString()
+			    val fileNamePath  = new Path(logPath+"/"+load_type+"_"+hive_table)
+
+			    if(Globals.logOvwrtInd)
+			    {
+			      fs.delete(fileNamePath)
+			      Globals.logOvwrtInd = false
+			    }
+
+			    if (!fs.exists(fileNamePath)){
+			      val output  = fs.create(fileNamePath)
+			      val os      = new BufferedOutputStream(output)
+			    try
+			      {
+			      os.write(content.getBytes("UTF-8"))
+			      }
+			    catch
+			    {
+					  case ex:Exception =>
+					    {
+					      logger.error("### Error while writing log ###")
+					      logger.error(s"$ex")
+					    }
+					}
+			    finally
+			    {
+			      os.close()
+			      logger.info("### OutputStream connection closed")
+			    }
+			    } else {
+			      val output  = fs.append(fileNamePath)
+			      val os      = new BufferedOutputStream(output)
+			    try
+			      {
+			      os.write(content.getBytes("UTF-8"))
+			      }
+			    catch
+			    {
+					  case ex:Exception =>
+					    {
+					      logger.error("### Error while writing log ###")
+					      logger.error(s"$ex")
+					    }
+					}
+			    finally
+			    {
+			      os.close()
+			      logger.info("### OutputStream connection closed")
+			    }
+			    }
+
+	}
+}
