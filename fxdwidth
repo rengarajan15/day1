@@ -1,0 +1,47 @@
+package fxdlength
+import org.apache.spark.SparkConf
+import org.apache.spark.sql.SparkSession
+// import org.apache.spark.sql.functions._
+// import org.apache.spark.sql.types._
+
+
+
+object Loadflength {
+
+	def main (args:Array[String])
+	{
+		val sparkConf = new SparkConf().setAppName("Spark Drools POC").setMaster("local")
+
+				// building spark session
+				val spark = SparkSession
+				.builder
+				.config(sparkConf)
+				.appName("Spark Drools POC")
+				.getOrCreate()
+
+				//DF for input Fixed Length Data
+				val inputdata=spark.read.option("header", "true").textFile("./emp.txt")
+				inputdata.show()
+
+				//DF for input mapsheet
+				val mapsheetdata =spark.read.option("header","true").csv("./mapsheet.csv")
+				mapsheetdata.show()
+				mapsheetdata.printSchema()
+				inputdata.createOrReplaceTempView("df")
+
+				//Passing mapingsheet rows in map
+				import spark.implicits._  
+				val q1= mapsheetdata.map(r=>"substr(value,"+r.getString(1)+","+r.getString(2)+")" +" as "+r.getString(0)+",").collect.mkString
+				val length=q1.length()
+				println(length)
+				val q2 =q1.substring(0,length-1)
+				println(q2)
+
+				//querying 	Inputdata DF
+				val finaldf=spark.sql(s"select $q2 from df")
+
+				spark.sql("create table flength as select * from df")
+
+	}
+
+}
